@@ -1,0 +1,34 @@
+# US-07 : alerte Grafana dès qu'un DAG MarketPlace passe en échec.
+# « unless … offset » compte aussi le 1er échec d'une série toute neuve (ignoré par increase()).
+apiVersion: 1
+groups:
+  - orgId: 1
+    name: marketplace-pipeline
+    folder: MarketPlace Analytics
+    interval: 1m
+    rules:
+      - uid: marketplace-dag-failed
+        title: DAG MarketPlace en échec
+        condition: C
+        for: 0m
+        labels:
+          severity: critical
+        annotations:
+          summary: "Au moins un run de DAG MarketPlace a échoué sur la dernière heure"
+          description: "Vérifier l'UI Airflow (http://localhost:8080) et la table analytics.dq_alerts"
+        data:
+          - refId: A
+            relativeTimeRange: {from: 3600, to: 0}
+            datasourceUid: prometheus
+            model:
+              refId: A
+              expr: 'sum((airflow_dagrun_duration_failed_count{dag_id=~"marketplace.*"} unless airflow_dagrun_duration_failed_count{dag_id=~"marketplace.*"} offset 1h) or increase(airflow_dagrun_duration_failed_count{dag_id=~"marketplace.*"}[1h])) or vector(0)'
+              instant: true
+          - refId: B
+            datasourceUid: __expr__
+            model: {refId: B, type: reduce, expression: A, reducer: last}
+          - refId: C
+            datasourceUid: __expr__
+            model: {refId: C, type: threshold, expression: B, conditions: [{evaluator: {type: gt, params: [0]}}]}
+        noDataState: OK
+        execErrState: Error

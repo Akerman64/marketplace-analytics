@@ -1,0 +1,321 @@
+# =============================================================================
+# MarketPlace Analytics — stack complète
+#   docker compose up -d --build     (premier lancement : ~2-3 min)
+#   docker compose ps                (tous les services doivent être healthy)
+# =============================================================================
+
+x-airflow-common: &airflow-common
+  build: .
+  image: marketplace-airflow:3.1.8
+  environment: &airflow-common-env
+    AIRFLOW__CORE__EXECUTOR: CeleryExecutor
+    AIRFLOW__CORE__AUTH_MANAGER: airflow.providers.fab.auth_manager.fab_auth_manager.FabAuthManager
+    AIRFLOW__DATABASE__SQL_ALCHEMY_CONN: postgresql+psycopg2://airflow:airflow@postgres-airflow/airflow
+    AIRFLOW__CELERY__RESULT_BACKEND: db+postgresql://airflow:airflow@postgres-airflow/airflow
+    AIRFLOW__CELERY__BROKER_URL: redis://:@redis:6379/0
+    AIRFLOW__CELERY__WORKER_CONCURRENCY: "8"
+    AIRFLOW__CORE__FERNET_KEY: ${AIRFLOW_FERNET_KEY}
+    AIRFLOW__CORE__DAGS_ARE_PAUSED_AT_CREATION: "true"
+    AIRFLOW__CORE__LOAD_EXAMPLES: "false"
+    AIRFLOW__CORE__EXECUTION_API_SERVER_URL: http://airflow-apiserver:8080/execution/
+    AIRFLOW__API_AUTH__JWT_SECRET: ${AIRFLOW_JWT_SECRET}
+    AIRFLOW__API__SECRET_KEY: ${AIRFLOW_API_SECRET_KEY}
+    AIRFLOW__SCHEDULER__ENABLE_HEALTH_CHECK: "true"
+    # @daily traite la journée écoulée (data interval [J-1, J[) : ds = J-1
+    AIRFLOW__SCHEDULER__CREATE_CRON_DATA_INTERVALS: "true"
+    # Métriques StatsD → statsd-exporter → Prometheus (bonus observabilité)
+    AIRFLOW__METRICS__STATSD_ON: "True"
+    AIRFLOW__METRICS__STATSD_HOST: statsd-exporter
+    AIRFLOW__METRICS__STATSD_PORT: "9125"
+    AIRFLOW__METRICS__STATSD_PREFIX: airflow
+    # Connections Airflow (aucun secret dans le code : tout vient du .env)
+    AIRFLOW_CONN_MARKETPLACE_API: '{"conn_type": "http", "host": "http://api-marketplace:5000", "password": "${MARKETPLACE_API_TOKEN}"}'
+    AIRFLOW_CONN_POSTGRES_DWH: '{"conn_type": "postgres", "host": "postgres-dwh", "port": 5432, "schema": "${DWH_DB}", "login": "${DWH_USER}", "password": "${DWH_PASSWORD}"}'
+    AIRFLOW_CONN_MINIO_S3: '{"conn_type": "aws", "login": "${MINIO_ROOT_USER}", "password": "${MINIO_ROOT_PASSWORD}", "extra": {"endpoint_url": "http://minio:9000", "region_name": "us-east-1"}}'
+  volumes:
+    - ./dags:/opt/airflow/dags
+    - ./plugins:/opt/airflow/plugins
+    - ./logs:/opt/airflow/logs
+    - ./config:/opt/airflow/config
+    - ./tests:/opt/airflow/tests
+  user: "${AIRFLOW_UID:-50000}:0"
+  networks: [airflow-net]
+  depends_on: &airflow-common-depends-on
+    redis:
+      condition: service_healthy
+    postgres-airflow:
+      condition: service_healthy
+
+services:
+  # ---------------------------------------------------------------- Airflow
+  postgres-airflow:
+    image: postgres:16
+    environment:
+      POSTGRES_USER: airflow
+      POSTGRES_PASSWORD: airflow
+      POSTGRES_DB: airflow
+      METABASE_DB_PASSWORD: ${METABASE_DB_PASSWORD}
+    volumes:
+      - pg-airflow-data:/var/lib/postgresql/data
+      - ./init-airflow-db:/docker-entrypoint-initdb.d:ro   # crée la base applicative de Metabase
+    healthcheck:
+      test: ["CMD", "pg_isready", "-U", "airflow"]
+      interval: 10s
+      retries: 5
+      start_period: 5s
+    restart: always
+    networks: [airflow-net]
+
+  redis:
+    image: redis:7
+    expose: ["6379"]
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 30s
+      retries: 50
+      start_period: 30s
+    restart: always
+    networks: [airflow-net]
+
+  airflow-apiserver:
+    <<: *airflow-common
+    command: api-server
+    ports: ["8080:8080"]
+    healthcheck:
+      test: ["CMD", "curl", "--fail", "http://localhost:8080/api/v2/version"]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+      start_period: 30s
+    restart: always
+    depends_on:
+      <<: *airflow-common-depends-on
+      airflow-init:
+        condition: service_completed_successfully
+
+  airflow-scheduler:
+    <<: *airflow-common
+    command: scheduler
+    healthcheck:
+      test: ["CMD", "curl", "--fail", "http://localhost:8974/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+      start_period: 30s
+    restart: always
+    depends_on:
+      <<: *airflow-common-depends-on
+      airflow-init:
+        condition: service_completed_successfully
+
+  airflow-dag-processor:
+    <<: *airflow-common
+    command: dag-processor
+    healthcheck:
+      test: ["CMD-SHELL", 'airflow jobs check --job-type DagProcessorJob --hostname "$${HOSTNAME}"']
+      interval: 30s
+      timeout: 10s
+      retries: 5
+      start_period: 30s
+    restart: always
+    depends_on:
+      <<: *airflow-common-depends-on
+      airflow-init:
+        condition: service_completed_successfully
+
+  airflow-worker:
+    <<: *airflow-common
+    command: celery worker
+    healthcheck:
+      test: ["CMD-SHELL", 'celery --app airflow.providers.celery.executors.celery_executor.app inspect ping -d "celery@$${HOSTNAME}" || celery --app airflow.executors.celery_executor.app inspect ping -d "celery@$${HOSTNAME}"']
+      interval: 30s
+      timeout: 10s
+      retries: 5
+      start_period: 30s
+    environment:
+      <<: *airflow-common-env
+      DUMB_INIT_SETSID: "0"
+    restart: always
+    depends_on:
+      <<: *airflow-common-depends-on
+      airflow-apiserver:
+        condition: service_healthy
+      airflow-init:
+        condition: service_completed_successfully
+
+  airflow-triggerer:
+    <<: *airflow-common
+    command: triggerer
+    healthcheck:
+      test: ["CMD-SHELL", 'airflow jobs check --job-type TriggererJob --hostname "$${HOSTNAME}"']
+      interval: 30s
+      timeout: 10s
+      retries: 5
+      start_period: 30s
+    restart: always
+    depends_on:
+      <<: *airflow-common-depends-on
+      airflow-init:
+        condition: service_completed_successfully
+
+  airflow-init:
+    <<: *airflow-common
+    entrypoint: /bin/bash
+    command:
+      - -c
+      - |
+        mkdir -p /opt/airflow/logs /opt/airflow/dags /opt/airflow/plugins /opt/airflow/config
+        chown -R "${AIRFLOW_UID}:0" /opt/airflow/logs /opt/airflow/config
+        exec /entrypoint airflow version
+    environment:
+      <<: *airflow-common-env
+      _AIRFLOW_DB_MIGRATE: "true"
+      _AIRFLOW_WWW_USER_CREATE: "true"
+      _AIRFLOW_WWW_USER_USERNAME: ${_AIRFLOW_WWW_USER_USERNAME:-airflow}
+      _AIRFLOW_WWW_USER_PASSWORD: ${_AIRFLOW_WWW_USER_PASSWORD:-airflow}
+    user: "0:0"
+
+  # ------------------------------------------------------- Data Warehouse
+  postgres-dwh:
+    image: postgres:18
+    environment:
+      POSTGRES_USER: ${DWH_USER}
+      POSTGRES_PASSWORD: ${DWH_PASSWORD}
+      POSTGRES_DB: ${DWH_DB}
+    ports: ["5433:5432"]
+    volumes:
+      - pg-dwh-data:/var/lib/postgresql        # convention PostgreSQL >= 18
+      - ./init-db:/docker-entrypoint-initdb.d:ro
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${DWH_USER} -d ${DWH_DB}"]
+      interval: 10s
+      retries: 5
+    restart: always
+    networks: [airflow-net]
+
+  # ---------------------------------------------------------- Data Lake
+  minio:
+    # L'image officielle minio/minio n'est plus publiée : build Bitnami équivalent
+    image: bitnamilegacy/minio:latest
+    environment:
+      MINIO_ROOT_USER: ${MINIO_ROOT_USER}
+      MINIO_ROOT_PASSWORD: ${MINIO_ROOT_PASSWORD}
+    ports: ["9000:9000", "9001:9001"]
+    volumes:
+      - minio-data:/bitnami/minio/data
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:9000/minio/health/live"]
+      interval: 10s
+      retries: 10
+    restart: always
+    networks: [airflow-net]
+
+  minio-init:
+    image: bitnamilegacy/minio-client:latest
+    entrypoint: ["/bin/sh", "-c"]
+    command:
+      - |
+        mc alias set local http://minio:9000 "${MINIO_ROOT_USER}" "${MINIO_ROOT_PASSWORD}" &&
+        mc mb --ignore-existing local/data-lake &&
+        echo "bucket data-lake prêt"
+    depends_on:
+      minio:
+        condition: service_healthy
+    networks: [airflow-net]
+
+  # ------------------------------------------------------ Source (API)
+  api-marketplace:
+    build: ./api
+    image: marketplace-api:1.0.0
+    environment:
+      API_TOKEN: ${MARKETPLACE_API_TOKEN}
+      API_FAILURE_RATE: ${API_FAILURE_RATE:-0.05}
+    ports: ["5001:5000"]     # 5000 est occupé par AirPlay sur macOS ; interne : api-marketplace:5000
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:5000/health')"]
+      interval: 15s
+      retries: 5
+      start_period: 20s
+    restart: always
+    networks: [airflow-net]
+
+  # ------------------------------------------------------------- BI
+  metabase:
+    image: metabase/metabase:v0.59.6.1
+    ports: ["3000:3000"]
+    environment:
+      # Métadonnées Metabase (dashboards, questions, comptes) dans PostgreSQL plutôt
+      # que H2 : la base H2 s'est corrompue lors d'un arrêt brutal de Docker.
+      MB_DB_TYPE: postgres
+      MB_DB_HOST: postgres-airflow
+      MB_DB_PORT: 5432
+      MB_DB_DBNAME: metabase
+      MB_DB_USER: metabase
+      MB_DB_PASS: ${METABASE_DB_PASSWORD}
+      JAVA_OPTS: "-Xmx1g"
+    volumes:
+      - metabase-data:/metabase-data      # plugins / fichiers locaux
+    depends_on:
+      postgres-dwh:
+        condition: service_healthy
+      postgres-airflow:
+        condition: service_healthy
+    restart: always
+    networks: [airflow-net]
+
+  # ------------------------------------------------- Observabilité (bonus)
+  statsd-exporter:
+    image: prom/statsd-exporter:latest
+    command: ["--statsd.mapping-config=/etc/statsd/mapping.yml"]
+    ports: ["9102:9102", "9125:9125/udp"]
+    volumes:
+      - ./observability/statsd_mapping.yml:/etc/statsd/mapping.yml:ro
+    restart: always
+    networks: [airflow-net]
+
+  postgres-exporter:
+    image: prometheuscommunity/postgres-exporter:latest
+    environment:
+      DATA_SOURCE_URI: postgres-dwh:5432/${DWH_DB}?sslmode=disable
+      DATA_SOURCE_USER: ${DWH_USER}
+      DATA_SOURCE_PASS: ${DWH_PASSWORD}
+    ports: ["9187:9187"]
+    depends_on:
+      postgres-dwh:
+        condition: service_healthy
+    restart: always
+    networks: [airflow-net]
+
+  prometheus:
+    image: prom/prometheus:latest
+    ports: ["9090:9090"]
+    volumes:
+      - ./observability/prometheus.yml:/etc/prometheus/prometheus.yml:ro
+      - prometheus-data:/prometheus
+    restart: always
+    networks: [airflow-net]
+
+  grafana:
+    image: grafana/grafana:latest
+    ports: ["3001:3000"]       # 3000 est pris par Metabase
+    environment:
+      GF_SECURITY_ADMIN_PASSWORD: ${GRAFANA_ADMIN_PASSWORD}
+    volumes:
+      - ./observability/grafana/provisioning:/etc/grafana/provisioning:ro
+      - ./observability/grafana/dashboards:/var/lib/grafana/dashboards:ro
+      - grafana-data:/var/lib/grafana
+    depends_on: [prometheus]
+    restart: always
+    networks: [airflow-net]
+
+networks:
+  airflow-net:
+
+volumes:
+  pg-airflow-data:
+  pg-dwh-data:
+  minio-data:
+  metabase-data:
+  prometheus-data:
+  grafana-data:
