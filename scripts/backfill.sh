@@ -5,6 +5,7 @@
 # la détection d'anomalies est rejouée ensuite sur la même plage.
 set -euo pipefail
 cd "$(dirname "$0")/.."
+export PATH="/Applications/Docker.app/Contents/Resources/bin:$PATH"   # CLI de Docker Desktop (macOS)
 FROM="${1:?date de début YYYY-MM-DD}"
 TO="${2:?date de fin YYYY-MM-DD}"
 

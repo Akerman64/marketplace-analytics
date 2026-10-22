@@ -215,22 +215,23 @@ def orders_for(day: date) -> list:
     return out
 
 
+def customer(cid: int) -> dict:
+    rng = random.Random(_seed(f"customer-{cid}"))
+    first = rng.choice(FIRST_NAMES)
+    last = rng.choice(SURNAMES)
+    country = rng.choices(["FR", "BE", "CH", "LU", "DE", "ES"], [0.82, 0.07, 0.03, 0.02, 0.03, 0.03])[0]
+    return {
+        "customer_id": cid,
+        "first_name": first,
+        "last_name": last,
+        "email": f"{first}.{last}.{cid}@example.com".lower(),
+        "country": country,
+        "signup_date": (LAUNCH_DATE + timedelta(days=rng.randint(0, 900))).isoformat(),
+    }
+
+
 def customers(limit: int) -> list:
-    out = []
-    for cid in range(1, limit + 1):
-        rng = random.Random(_seed(f"customer-{cid}"))
-        first = rng.choice(FIRST_NAMES)
-        last = rng.choice(SURNAMES)
-        country = rng.choices(["FR", "BE", "CH", "LU", "DE", "ES"], [0.82, 0.07, 0.03, 0.02, 0.03, 0.03])[0]
-        out.append({
-            "customer_id": cid,
-            "first_name": first,
-            "last_name": last,
-            "email": f"{first}.{last}.{cid}@example.com".lower(),
-            "country": country,
-            "signup_date": (LAUNCH_DATE + timedelta(days=rng.randint(0, 900))).isoformat(),
-        })
-    return out
+    return [customer(cid) for cid in range(1, limit + 1)]
 
 
 def public(record: dict) -> dict:

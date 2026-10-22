@@ -4,6 +4,7 @@
 #   ./scripts/test_idempotence.sh [YYYY-MM-DD]
 set -euo pipefail
 cd "$(dirname "$0")/.."
+export PATH="/Applications/Docker.app/Contents/Resources/bin:$PATH"   # CLI de Docker Desktop (macOS)
 DS="${1:-2026-04-07}"
 
 count() {

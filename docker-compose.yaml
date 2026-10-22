@@ -224,14 +224,53 @@ services:
         condition: service_healthy
     networks: [airflow-net]
 
-  # ------------------------------------------------------ Source (API)
+  # ------------------------------------- Source : base du site + son API
+  mysql-backoffice:
+    # Base transactionnelle (OLTP) du site : la source réelle des ventes
+    image: mysql:8.4
+    environment:
+      MYSQL_DATABASE: ${BACKOFFICE_DB}
+      MYSQL_USER: ${BACKOFFICE_USER}
+      MYSQL_PASSWORD: ${BACKOFFICE_PASSWORD}
+      MYSQL_ROOT_PASSWORD: ${BACKOFFICE_ROOT_PASSWORD}
+    ports: ["3306:3306"]
+    volumes:
+      - mysql-backoffice-data:/var/lib/mysql
+      - ./init-backoffice:/docker-entrypoint-initdb.d:ro
+    healthcheck:
+      test: ["CMD-SHELL", "mysqladmin ping -h 127.0.0.1 -u$$MYSQL_USER -p$$MYSQL_PASSWORD --silent"]
+      interval: 10s
+      retries: 12
+      start_period: 30s
+    restart: always
+    networks: [airflow-net]
+
+  backoffice-seed:
+    # Remplit la base au premier démarrage (catalogue + 60 derniers jours), rejouable
+    build: ./api
+    image: marketplace-api:2.0.0
+    command: ["python", "seed.py"]
+    environment: &backoffice-db-env
+      MYSQL_HOST: mysql-backoffice
+      MYSQL_DATABASE: ${BACKOFFICE_DB}
+      MYSQL_USER: ${BACKOFFICE_USER}
+      MYSQL_PASSWORD: ${BACKOFFICE_PASSWORD}
+    depends_on:
+      mysql-backoffice:
+        condition: service_healthy
+    networks: [airflow-net]
+
   api-marketplace:
     build: ./api
-    image: marketplace-api:1.0.0
+    image: marketplace-api:2.0.0
     environment:
+      <<: *backoffice-db-env
       API_TOKEN: ${MARKETPLACE_API_TOKEN}
       API_FAILURE_RATE: ${API_FAILURE_RATE:-0.05}
-    ports: ["5001:5000"]     # 5000 est occupé par AirPlay sur macOS ; interne : api-marketplace:5000
+    depends_on:
+      backoffice-seed:
+        condition: service_completed_successfully
+    ports: ["5002:5000"]     # 5000 est occupé par AirPlay sur macOS, 5001 par le backend Addlean ; interne : api-marketplace:5000
     healthcheck:
       test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:5000/health')"]
       interval: 15s
@@ -313,6 +352,7 @@ networks:
   airflow-net:
 
 volumes:
+  mysql-backoffice-data:
   pg-airflow-data:
   pg-dwh-data:
   minio-data:

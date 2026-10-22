@@ -1,11 +1,12 @@
 # MarketPlace Analytics — Maelys
 
 MVP de plateforme data pour **Maelys Marketplace** : ingestion automatique des
-commandes depuis l'API du backoffice, Data Warehouse dimensionnel (Kimball),
+commandes de la base du site (MySQL) via l'API du backoffice, Data Warehouse dimensionnel (Kimball),
 KPIs dans Metabase, détection d'anomalies et supervision Prometheus / Grafana.
 
 | | |
 |---|---|
+| **Source (OLTP)** | MySQL 8.4 — base du site (vendeurs, produits, clients, commandes), exposée par l'API Flask |
 | **Orchestration** | Airflow 3.1.8 (CeleryExecutor) — 4 DAGs |
 | **Raw layer** | MinIO (S3) — `s3://data-lake/raw/<entité>/dt=YYYY-MM-DD/data.json` |
 | **Data Warehouse** | PostgreSQL 18 — schémas `staging` / `dwh` / `analytics` |
@@ -23,8 +24,10 @@ KPIs dans Metabase, détection d'anomalies et supervision Prometheus / Grafana.
 
 ```mermaid
 flowchart LR
-  subgraph SRC["Source"]
-    API[("API Marketplace<br/>Flask simulée<br/>Bearer token")]
+  subgraph SRC["Source — backoffice du site"]
+    OLTP[("MySQL 8.4<br/>base transactionnelle")]
+    API["API Marketplace<br/>Flask · Bearer token"]
+    OLTP --> API
   end
   subgraph ORCH["Orchestration — Airflow 3.1.8"]
     HOOK["MarketplaceAPIHook<br/>(retry 5xx / timeout)"]
@@ -72,11 +75,14 @@ sequenceDiagram
   participant S as Scheduler
   participant H as MarketplaceAPIHook
   participant A as API Marketplace
+  participant O as MySQL backoffice
   participant M as MinIO
   participant P as PostgreSQL DWH
   participant G as DAG analytics
   S->>H: extract_orders_to_raw (ds)
   H->>A: GET /orders?date=ds (Bearer, retry ×3)
+  A->>O: SELECT … FROM orders WHERE order_date = ds
+  O-->>A: lignes de la journée
   A-->>H: ~8 500 commandes (JSON)
   H->>M: PUT raw/orders/dt=ds/data.json
   S->>P: load_staging_orders : relit MinIO, DELETE + COPY staging.orders
@@ -109,7 +115,7 @@ Ou pas à pas :
 
 ```bash
 docker compose up -d --build          # ~2 min ; vérifier : docker compose ps (tout healthy)
-curl http://localhost:5001/health     # API simulée
+curl http://localhost:5002/health     # API simulée
 
 # Dimensions puis pipeline principal sur une date
 docker compose exec airflow-worker airflow dags test marketplace_dims_refresh_daily 2026-04-07
@@ -128,15 +134,16 @@ docker compose exec airflow-worker pytest tests/ -v
 | Metabase | http://localhost:3000 | `admin@maelys.local` / `Admin2026!` |
 | Grafana | http://localhost:3001 | `admin` / `admin` |
 | Prometheus | http://localhost:9090 | — |
-| API Marketplace | http://localhost:5001 | Bearer `formation-token-2026` |
+| API Marketplace | http://localhost:5002 | Bearer `formation-token-2026` |
 | PostgreSQL DWH | `psql -h localhost -p 5433 -U dwh_user -d dwh` | mot de passe dans `.env` |
+| MySQL backoffice (base du site) | `docker compose exec mysql-backoffice mysql -ubackoffice_user -p --default-character-set=utf8mb4 backoffice` · ou un outil graphique sur `localhost:3306` · ou Metabase (« Backoffice Maelys ») | `backoffice_password_2026` |
 | MinIO (API S3) | http://localhost:9000 | `minio_admin` / `minio_password_2026` |
 
 ### Écarts volontaires avec le cahier des charges
 
 | Point | Raison | Solution retenue |
 |---|---|---|
-| API exposée sur **5001** (pas 5000) | Le port 5000 est occupé par AirPlay sur macOS | Mapping `5001:5000` ; en interne, `api-marketplace:5000` |
+| API exposée sur **5002** (pas 5000 ni 5001) | Le port 5000 est occupé par AirPlay sur macOS, le 5001 par le backend Addlean | Mapping `5002:5000` ; en interne, `api-marketplace:5000` |
 | `postgres-airflow` non exposé | Un PostgreSQL local occupe déjà 5432 sur l'hôte | Accessible depuis les conteneurs uniquement |
 | Image MinIO **Bitnami** | `minio/minio` n'est plus publiée sur Docker Hub / quay.io | `bitnamilegacy/minio` + `bitnamilegacy/minio-client` pour `minio-init` |
 | Pas de console MinIO (9001) | Retirée des builds communautaires de MinIO en 2025 | Bucket créé par `minio-init` ; exploration via `mc` |
@@ -145,11 +152,25 @@ docker compose exec airflow-worker pytest tests/ -v
 
 ---
 
-## 3. API Marketplace (simulée)
+## 3. La source : base MySQL du site + API Marketplace
 
-Le kit ne fournissant pas l'API, elle a été écrite dans [`api/`](api/) en respectant le contrat :
-`GET /health`, `/orders?date=`, `/sellers?limit=`, `/products`, `/customers?limit=` ; auth
-Bearer (401 sinon) ; **seed = md5(date)** → une même date renvoie toujours les mêmes commandes.
+Le kit ne fournissant pas l'API, la source a été construite dans [`api/`](api/) comme dans une
+vraie entreprise : **une base transactionnelle (OLTP) et une API devant elle**.
+
+| Brique | Rôle |
+|---|---|
+| **MySQL 8.4 `mysql-backoffice`** ([`init-backoffice/schema.sql`](init-backoffice/schema.sql)) | La base du site : `sellers`, `products`, `customers`, `orders` (clés étrangères), `recorded_days` |
+| **`backoffice-seed`** ([`api/seed.py`](api/seed.py)) | Remplit la base au démarrage (rejouable) : 2 400 vendeurs, 180 000 produits, 1 200 000 clients, 60 derniers jours de ventes |
+| **API Flask `api-marketplace`** ([`api/app.py`](api/app.py)) | La seule porte d'accès pour l'équipe data : lit la base MySQL, vérifie le token, renvoie du JSON |
+
+L'équipe data n'accède jamais directement à la base du site (sécurité, pas de charge sur la
+production, contrat stable) : Airflow passe par l'API, comme l'exige le cahier.
+Une journée jamais demandée est d'abord enregistrée dans MySQL par le simulateur du site
+([`api/db.py`](api/db.py), `record_day`), puis toujours relue depuis MySQL.
+
+Contrat de l'API : `GET /health`, `/orders?date=`, `/sellers?limit=`, `/products`,
+`/customers?limit=` ; auth Bearer (401 sinon) ; **seed = md5(date)** → une même date donne
+toujours les mêmes commandes.
 
 Volumétrie calibrée sur le cahier des charges : 2 400 vendeurs, 180 000 produits,
 ~8 500 commandes/jour, ~4,2 M€ de CA mensuel (panier moyen ~16,5 €). Le générateur
@@ -414,10 +435,11 @@ Grafana ; Great Expectations à la place du `DataQualityOperator` ; CI exécutan
 ## 14. Structure du dépôt
 
 ```
-├── docker-compose.yaml        # 17 services (Airflow, PostgreSQL ×2, MinIO, API, Metabase, observabilité)
+├── docker-compose.yaml        # 19 services (MySQL, API, Airflow, PostgreSQL ×2, MinIO, Metabase, observabilité)
 ├── Dockerfile                 # image Airflow 3.1.8 + pytest
 ├── .env.example               # variables (copier en .env)
-├── api/                       # API Flask simulée (déterministe : seed = md5(date))
+├── api/                       # API Flask + simulateur du site (déterministe : seed = md5(date))
+├── init-backoffice/           # DDL de la base MySQL du site (OLTP)
 ├── dags/                      # 4 DAGs + sql/ (transformations Jinja)
 ├── plugins/marketplace/       # MarketplaceAPIHook, DataQualityOperator, helpers
 ├── init-db/schema.sql         # DDL staging / dwh / analytics

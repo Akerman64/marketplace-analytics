@@ -3,6 +3,7 @@
 #   ./scripts/bootstrap.sh
 set -euo pipefail
 cd "$(dirname "$0")/.."
+export PATH="/Applications/Docker.app/Contents/Resources/bin:$PATH"   # CLI de Docker Desktop (macOS)
 [ -f .env ] || cp .env.example .env
 
 echo "▶ 1/5 Démarrage de la stack"

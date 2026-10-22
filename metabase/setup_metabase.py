@@ -3,8 +3,9 @@
 
     python3 metabase/setup_metabase.py
 
-1. Crée le compte admin (premier login) et la source de données PostgreSQL DWH
-   (host postgres-dwh, port interne 5432 — nom Docker, pas localhost)
+1. Crée le compte admin (premier login), la source de données PostgreSQL DWH
+   (host postgres-dwh, port interne 5432 — nom Docker, pas localhost) et la
+   base MySQL du backoffice en seconde source (pour parcourir ses tables)
 2. Crée les questions SQL natives et les 5 dashboards :
      - Executive Summary          (MVP, US-01 / US-02)
      - Top Sellers                (MVP, US-02)
@@ -28,6 +29,12 @@ DWH = {
     "user": os.environ.get("DWH_USER", "dwh_user"),
     "password": os.environ.get("DWH_PASSWORD", "dwh_password_2026"),
     "ssl": False,
+}
+BACKOFFICE = {
+    "host": "mysql-backoffice", "port": 3306, "dbname": os.environ.get("BACKOFFICE_DB", "backoffice"),
+    "user": os.environ.get("BACKOFFICE_USER", "backoffice_user"),
+    "password": os.environ.get("BACKOFFICE_PASSWORD", "backoffice_password_2026"),
+    "ssl": False, "additional-options": "allowPublicKeyRetrieval=true",
 }
 COLLECTION_NAME = "MarketPlace Analytics"
 
@@ -209,7 +216,7 @@ class Metabase:
         self.s = requests.Session()
 
     def call(self, method, path, **kw):
-        r = self.s.request(method, f"{self.url}/api{path}", timeout=60, **kw)
+        r = self.s.request(method, f"{self.url}/api{path}", timeout=180, **kw)
         if r.status_code >= 400:
             raise RuntimeError(f"{method} {path} → {r.status_code} : {r.text[:400]}")
         return r.json() if r.text else None
@@ -248,6 +255,16 @@ class Metabase:
         print(f"✅ Source de données DWH ajoutée (id {db['id']})")
         return db["id"]
 
+    def ensure_backoffice_db(self):
+        """Base MySQL du site, en lecture : pour parcourir ses tables depuis Metabase."""
+        dbs = self.call("GET", "/database")
+        dbs = dbs.get("data", dbs) if isinstance(dbs, dict) else dbs
+        if any(db.get("engine") == "mysql" for db in dbs):
+            return
+        db = self.call("POST", "/database", json={"engine": "mysql", "name": "Backoffice Maelys (MySQL)",
+                                                  "details": BACKOFFICE, "is_full_sync": True})
+        print(f"✅ Source de données Backoffice MySQL ajoutée (id {db['id']})")
+
     def collection_id(self):
         for c in self.call("GET", "/collection"):
             if c.get("name") == COLLECTION_NAME and not c.get("archived"):
@@ -269,6 +286,7 @@ def main():
     mb.wait_ready()
     mb.setup_or_login()
     db_id = mb.database_id()
+    mb.ensure_backoffice_db()
     coll_id = mb.collection_id()
     mb.clear_collection(coll_id)
 
